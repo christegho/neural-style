@@ -111,34 +111,43 @@ def stylize(network, initial, initial_noiseblend, content, styles, preserve_colo
 
         content_loss = 0
         content_losses = []
-        for content_layer in CONTENT_LAYERS:
+
+        with tf.device('/gpu:0'):
+            content_layer = 'relu4_2'
             content_losses.append(content_layers_weights[content_layer] * content_weight * (2 * tf.nn.l2_loss(
                     net[content_layer] - content_features[content_layer]) /
                     content_features[content_layer].size))
-        content_loss += reduce(tf.add, content_losses)
+        with tf.device('/gpu:1'):
+            content_layer = 'relu5_2'
+            content_losses.append(content_layers_weights[content_layer] * content_weight * (2 * tf.nn.l2_loss(
+                    net[content_layer] - content_features[content_layer]) /
+                    content_features[content_layer].size))
+            content_loss += reduce(tf.add, content_losses)
 
         # style loss
         style_loss = 0
-        for i in range(len(styles)):
-            style_losses = []
-            for style_layer in STYLE_LAYERS:
-                layer = net[style_layer]
-                _, height, width, number = map(lambda i: i.value, layer.get_shape())
-                size = height * width * number
-                feats = tf.reshape(layer, (-1, number))
-                gram = tf.matmul(tf.transpose(feats), feats) / size
-                style_gram = style_features[i][style_layer]
-                style_losses.append(style_layers_weights[style_layer] * 2 * tf.nn.l2_loss(gram - style_gram) / style_gram.size)
-            style_loss += style_weight * style_blend_weights[i] * reduce(tf.add, style_losses)
+        with tf.device('/gpu:1'):
+            for i in range(len(styles)):
+                style_losses = []
+                for style_layer in STYLE_LAYERS:
+                    layer = net[style_layer]
+                    _, height, width, number = map(lambda i: i.value, layer.get_shape())
+                    size = height * width * number
+                    feats = tf.reshape(layer, (-1, number))
+                    gram = tf.matmul(tf.transpose(feats), feats) / size
+                    style_gram = style_features[i][style_layer]
+                    style_losses.append(style_layers_weights[style_layer] * 2 * tf.nn.l2_loss(gram - style_gram) / style_gram.size)
+                style_loss += style_weight * style_blend_weights[i] * reduce(tf.add, style_losses)
 
         # total variation denoising
-        tv_y_size = _tensor_size(image[:,1:,:,:])
-        tv_x_size = _tensor_size(image[:,:,1:,:])
-        tv_loss = tv_weight * 2 * (
-                (tf.nn.l2_loss(image[:,1:,:,:] - image[:,:shape[1]-1,:,:]) /
-                    tv_y_size) +
-                (tf.nn.l2_loss(image[:,:,1:,:] - image[:,:,:shape[2]-1,:]) /
-                    tv_x_size))
+        with tf.device('/gpu:1'):
+            tv_y_size = _tensor_size(image[:,1:,:,:])
+            tv_x_size = _tensor_size(image[:,:,1:,:])
+            tv_loss = tv_weight * 2 * (
+                    (tf.nn.l2_loss(image[:,1:,:,:] - image[:,:shape[1]-1,:,:]) /
+                        tv_y_size) +
+                    (tf.nn.l2_loss(image[:,:,1:,:] - image[:,:,:shape[2]-1,:]) /
+                        tv_x_size))
 
         # total loss
         loss = content_loss + style_loss + tv_loss
@@ -162,12 +171,14 @@ def stylize(network, initial, initial_noiseblend, content, styles, preserve_colo
                                   ('total', loss)])
 
         # optimizer setup
-        train_step = tf.train.AdamOptimizer(learning_rate, beta1, beta2, epsilon).minimize(loss)
+        train_step = tf.train.AdamOptimizer(learning_rate, beta1, beta2, epsilon).minimize(loss, 
+            colocate_gradients_with_ops=True)
 
         # optimization
         best_loss = float('inf')
         best = None
-        with tf.Session() as sess:
+        config = tf.ConfigProto(allow_soft_placement=True)
+        with tf.Session(config=config) as sess:
             sess.run(tf.global_variables_initializer())
             print('Optimization started...')
             if (print_iterations and print_iterations != 0):
